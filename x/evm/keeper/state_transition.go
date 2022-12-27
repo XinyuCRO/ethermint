@@ -1,10 +1,12 @@
 package keeper
 
 import (
+	"context"
 	"math"
 	"math/big"
 
 	sdkmath "cosmossdk.io/math"
+	"go.opentelemetry.io/otel/codes"
 
 	tmtypes "github.com/tendermint/tendermint/types"
 
@@ -193,24 +195,39 @@ func (k Keeper) GetHashFn(ctx sdk.Context) vm.GetHashFunc {
 // returning.
 //
 // For relevant discussion see: https://github.com/cosmos/cosmos-sdk/discussions/9072
-func (k *Keeper) ApplyTransaction(ctx sdk.Context, tx *ethtypes.Transaction) (*types.MsgEthereumTxResponse, error) {
+func (k *Keeper) ApplyTransaction(goCtx context.Context, tx *ethtypes.Transaction) (*types.MsgEthereumTxResponse, error) {
+
+	newCtx, sp := Tracer.Start(goCtx, "ApplyTransaction")
+	defer sp.End()
+	ctx := sdk.UnwrapSDKContext(newCtx)
+
 	var (
 		bloom        *big.Int
 		bloomReceipt ethtypes.Bloom
 	)
 
+	_, span := Tracer.Start(newCtx, "loadEVMConfig")
 	cfg, err := k.EVMConfig(ctx)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to load evm config")
+		span.End()
 		return nil, sdkerrors.Wrap(err, "failed to load evm config")
 	}
+	span.End()
 	txConfig := k.TxConfig(ctx, tx.Hash())
 
+	_, span = Tracer.Start(newCtx, "MakeSigner")
 	// get the signer according to the chain rules from the config and block height
 	signer := ethtypes.MakeSigner(cfg.ChainConfig, big.NewInt(ctx.BlockHeight()))
 	msg, err := tx.AsMessage(signer, cfg.BaseFee)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to return ethereum transaction as core message")
+		span.End()
 		return nil, sdkerrors.Wrap(err, "failed to return ethereum transaction as core message")
 	}
+	span.End()
 
 	// snapshot to contain the tx processing and post processing in same scope
 	var commit func()
@@ -224,7 +241,7 @@ func (k *Keeper) ApplyTransaction(ctx sdk.Context, tx *ethtypes.Transaction) (*t
 	}
 
 	// pass true to commit the StateDB
-	res, err := k.ApplyMessageWithConfig(tmpCtx, msg, nil, true, cfg, txConfig)
+	res, err := k.ApplyMessageWithConfig(newCtx, tmpCtx, msg, nil, true, cfg, txConfig)
 	if err != nil {
 		return nil, sdkerrors.Wrap(err, "failed to apply ethereum core message")
 	}
@@ -344,13 +361,22 @@ func (k *Keeper) ApplyTransaction(ctx sdk.Context, tx *ethtypes.Transaction) (*t
 // # Commit parameter
 //
 // If commit is true, the `StateDB` will be committed, otherwise discarded.
-func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context,
+func (k *Keeper) ApplyMessageWithConfig(goCtx context.Context, ctx sdk.Context,
 	msg core.Message,
 	tracer vm.EVMLogger,
 	commit bool,
 	cfg *types.EVMConfig,
 	txConfig statedb.TxConfig,
 ) (*types.MsgEthereumTxResponse, error) {
+
+	if Tracer == nil {
+		_, shutdown := NewTracer()
+		defer shutdown()
+	}
+
+	goCtx, sp := Tracer.Start(goCtx, "ApplyTransactionWithConfig")
+	defer sp.End()
+
 	var (
 		ret   []byte // return bytes from evm execution
 		vmErr error  // vm errors do not effect consensus and are therefore not assigned to err
@@ -363,8 +389,10 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context,
 		return nil, sdkerrors.Wrap(types.ErrCallDisabled, "failed to call contract")
 	}
 
+	_, span := Tracer.Start(goCtx, "init stateDB & evm")
 	stateDB := statedb.New(ctx, k, txConfig)
 	evm := k.NewEVM(ctx, msg, cfg, tracer, stateDB)
+	span.End()
 
 	leftoverGas := msg.Gas()
 
@@ -381,11 +409,18 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context,
 	contractCreation := msg.To() == nil
 	isLondon := cfg.ChainConfig.IsLondon(evm.Context().BlockNumber)
 
+	_, span = Tracer.Start(goCtx, "GetEthIntrinsicGas")
 	intrinsicGas, err := k.GetEthIntrinsicGas(ctx, msg, cfg.ChainConfig, contractCreation)
 	if err != nil {
 		// should have already been checked on Ante Handler
+		span.RecordError(err)
+		span.SetAttributes()
+		span.SetStatus(codes.Error, "intrinsic gas failed")
+
+		span.End()
 		return nil, sdkerrors.Wrap(err, "intrinsic gas failed")
 	}
+	span.End()
 
 	// Should check again even if it is checked on Ante Handler, because eth_call don't go through Ante Handler.
 	if leftoverGas < intrinsicGas {
@@ -397,18 +432,27 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context,
 	// access list preparation is moved from ante handler to here, because it's needed when `ApplyMessage` is called
 	// under contexts where ante handlers are not run, for example `eth_call` and `eth_estimateGas`.
 	if rules := cfg.ChainConfig.Rules(big.NewInt(ctx.BlockHeight()), cfg.ChainConfig.MergeNetsplitBlock != nil); rules.IsBerlin {
+		_, span = Tracer.Start(goCtx, "PrepareAccessList")
 		stateDB.PrepareAccessList(msg.From(), msg.To(), evm.ActivePrecompiles(rules), msg.AccessList())
+		span.End()
 	}
 
 	if contractCreation {
 		// take over the nonce management from evm:
 		// - reset sender's nonce to msg.Nonce() before calling evm.
 		// - increase sender's nonce by one no matter the result.
+
+		_, span = Tracer.Start(goCtx, "evm, ContractCreation")
+
 		stateDB.SetNonce(sender.Address(), msg.Nonce())
 		ret, _, leftoverGas, vmErr = evm.Create(sender, msg.Data(), leftoverGas, msg.Value())
 		stateDB.SetNonce(sender.Address(), msg.Nonce()+1)
+
+		span.End()
 	} else {
+		_, span = Tracer.Start(goCtx, "evm, NormalContractCall")
 		ret, leftoverGas, vmErr = evm.Call(sender, *msg.To(), msg.Data(), leftoverGas, msg.Value())
+		span.End()
 	}
 
 	refundQuotient := params.RefundQuotient
@@ -433,11 +477,17 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context,
 
 	// The dirty states in `StateDB` is either committed or discarded after return
 	if commit {
+		_, span = Tracer.Start(goCtx, "StateDB Commit")
 		if err := stateDB.Commit(); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "StateDB Commit")
+			span.End()
 			return nil, sdkerrors.Wrap(err, "failed to commit stateDB")
 		}
+		span.End()
 	}
 
+	_, span = Tracer.Start(goCtx, "Calculate gas leftover")
 	// calculate a minimum amount of gas to be charged to sender if GasLimit
 	// is considerably higher than GasUsed to stay more aligned with Tendermint gas mechanics
 	// for more info https://github.com/evmos/ethermint/issues/1085
@@ -446,8 +496,12 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context,
 	minimumGasUsed := gasLimit.Mul(minGasMultiplier)
 
 	if msg.Gas() < leftoverGas {
+		span.RecordError(types.ErrGasOverflow)
+		span.SetStatus(codes.Error, "gas overflow")
+		span.End()
 		return nil, sdkerrors.Wrapf(types.ErrGasOverflow, "message gas limit < leftover gas (%d < %d)", msg.Gas(), leftoverGas)
 	}
+	span.End()
 	temporaryGasUsed := msg.Gas() - leftoverGas
 	gasUsed := sdk.MaxDec(minimumGasUsed, sdk.NewDec(int64(temporaryGasUsed))).TruncateInt().Uint64()
 	// reset leftoverGas, to be used by the tracer
@@ -463,13 +517,13 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context,
 }
 
 // ApplyMessage calls ApplyMessageWithConfig with default EVMConfig
-func (k *Keeper) ApplyMessage(ctx sdk.Context, msg core.Message, tracer vm.EVMLogger, commit bool) (*types.MsgEthereumTxResponse, error) {
+func (k *Keeper) ApplyMessage(goCtx context.Context, ctx sdk.Context, msg core.Message, tracer vm.EVMLogger, commit bool) (*types.MsgEthereumTxResponse, error) {
 	cfg, err := k.EVMConfig(ctx)
 	if err != nil {
 		return nil, sdkerrors.Wrap(err, "failed to load evm config")
 	}
 	txConfig := statedb.NewEmptyTxConfig(common.BytesToHash(ctx.HeaderHash()))
-	return k.ApplyMessageWithConfig(ctx, msg, tracer, commit, cfg, txConfig)
+	return k.ApplyMessageWithConfig(goCtx, ctx, msg, tracer, commit, cfg, txConfig)
 }
 
 // GetEthIntrinsicGas returns the intrinsic gas cost for the transaction

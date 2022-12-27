@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/armon/go-metrics"
 	tmbytes "github.com/tendermint/tendermint/libs/bytes"
 	tmtypes "github.com/tendermint/tendermint/types"
 
-	"github.com/armon/go-metrics"
+	oteltrace "go.opentelemetry.io/otel/trace"
+
 	"github.com/cosmos/cosmos-sdk/telemetry"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
@@ -24,7 +26,18 @@ var _ types.MsgServer = &Keeper{}
 // so that it can implements and call the StateDB methods without receiving it as a function
 // parameter.
 func (k *Keeper) EthereumTx(goCtx context.Context, msg *types.MsgEthereumTx) (*types.MsgEthereumTxResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	tracer, shutdown := NewTracer()
+	defer shutdown()
+
+	opts := []oteltrace.SpanStartOption{
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+	}
+
+	oldCtx, sp := tracer.Start(goCtx, "EthereumTx", opts...)
+	ctx := sdk.UnwrapSDKContext(oldCtx)
+
+	defer sp.End()
 
 	sender := msg.From
 	tx := msg.AsTransaction()
@@ -43,7 +56,8 @@ func (k *Keeper) EthereumTx(goCtx context.Context, msg *types.MsgEthereumTx) (*t
 		}
 	}
 
-	response, err := k.ApplyTransaction(ctx, tx)
+	response, err := k.ApplyTransaction(oldCtx, tx)
+
 	if err != nil {
 		return nil, sdkerrors.Wrap(err, "failed to apply transaction")
 	}
@@ -86,6 +100,8 @@ func (k *Keeper) EthereumTx(goCtx context.Context, msg *types.MsgEthereumTx) (*t
 		sdk.NewAttribute(types.AttributeKeyTxGasUsed, strconv.FormatUint(response.GasUsed, 10)),
 	}
 
+	_, span := tracer.Start(oldCtx, "EmitEvents")
+
 	if len(ctx.TxBytes()) > 0 {
 		// add event for tendermint transaction hash format
 		hash := tmbytes.HexBytes(tmtypes.Tx(ctx.TxBytes()).Hash())
@@ -126,6 +142,7 @@ func (k *Keeper) EthereumTx(goCtx context.Context, msg *types.MsgEthereumTx) (*t
 			sdk.NewAttribute(types.AttributeKeyTxType, fmt.Sprintf("%d", tx.Type())),
 		),
 	})
+	span.End()
 
 	return response, nil
 }

@@ -524,7 +524,7 @@ func (suite *EvmTestSuite) deployERC20Contract() common.Address {
 		nil,
 		true,
 	)
-	rsp, err := k.ApplyMessage(suite.ctx, msg, nil, true)
+	rsp, err := k.ApplyMessage(suite.ctx.Context(), suite.ctx, msg, nil, true)
 	suite.Require().NoError(err)
 	suite.Require().False(rsp.Failed())
 	return crypto.CreateAddress(suite.from, nonce)
