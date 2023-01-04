@@ -38,5 +38,34 @@ services:
     ports:
       - "9090:9090"
 
+  influxdb:
+    image: influxdb:latest
+    container_name: influxdb
+    ports:
+      - "8083:8083"
+      - "8086:8086"
+      - "8090:8090"
+      - "2003:2003"
+    env_file:
+      - 'env.influxdb'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./influxdb-data:/var/lib/influxdb
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    env_file:
+      - 'env.grafana'
+    user: "0"
+    links:
+      - influxdb
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./grafana-data:/var/lib/grafana
+      - ./provisioning:/etc/grafana/provisioning
+
 networks:
   backend:
