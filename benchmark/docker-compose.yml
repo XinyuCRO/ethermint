@@ -1,8 +1,6 @@
 version: "3.5"
 services:
   jaeger:
-    networks:
-      - backend
     image: jaegertracing/all-in-one:latest
     volumes:
       - "./jaeger-ui.json:/etc/jaeger/jaeger-ui.json"
@@ -18,8 +16,6 @@ services:
       - "16685:16685"
 
   otel_collector:
-    networks:
-      - backend
     image: otel/opentelemetry-collector-contrib:latest
     volumes:
       - "./otel-collector-config.yml:/etc/otelcol/otel-collector-config.yml"
@@ -30,8 +26,6 @@ services:
       - jaeger
 
   prometheus:
-    networks:
-      - backend
     image: prom/prometheus:latest
     volumes:
       - "./prometheus.yml:/etc/prometheus/prometheus.yml"
@@ -66,6 +60,3 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./grafana-data:/var/lib/grafana
       - ./provisioning:/etc/grafana/provisioning
-
-networks:
-  backend:
