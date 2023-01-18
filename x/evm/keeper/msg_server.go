@@ -15,6 +15,8 @@ import (
 	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
 
 	"github.com/evmos/ethermint/x/evm/types"
+
+	tracer "github.com/zxy/trace-lib/pkg"
 )
 
 var _ types.MsgServer = &Keeper{}
@@ -25,6 +27,10 @@ var _ types.MsgServer = &Keeper{}
 // parameter.
 func (k *Keeper) EthereumTx(goCtx context.Context, msg *types.MsgEthereumTx) (*types.MsgEthereumTxResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	t := tracer.NewEthermintTracer()
+	span := t.StartSpan("EthermumTx")
+	defer span.End()
 
 	sender := msg.From
 	tx := msg.AsTransaction()
@@ -85,6 +91,9 @@ func (k *Keeper) EthereumTx(goCtx context.Context, msg *types.MsgEthereumTx) (*t
 		// add event for eth tx gas used, we can't get it from cosmos tx result when it contains multiple eth tx msgs.
 		sdk.NewAttribute(types.AttributeKeyTxGasUsed, strconv.FormatUint(response.GasUsed, 10)),
 	}
+
+	span = t.StartSpan("EmitEvents")
+	defer span.End()
 
 	if len(ctx.TxBytes()) > 0 {
 		// add event for tendermint transaction hash format
