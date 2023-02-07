@@ -49,10 +49,14 @@ func (k *Keeper) EthereumTx(goCtx context.Context, msg *types.MsgEthereumTx) (*t
 		}
 	}
 
+	span = t.StartSpan("ApplyTransaction")
 	response, err := k.ApplyTransaction(ctx, tx)
 	if err != nil {
+		span.RecordError(err)
+		span.End()
 		return nil, sdkerrors.Wrap(err, "failed to apply transaction")
 	}
+	span.End()
 
 	defer func() {
 		telemetry.IncrCounterWithLabels(

@@ -24,6 +24,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
+
+	tracerN "github.com/zxy/trace-lib/pkg"
 )
 
 // GasToRefund calculates the amount of gas the state machine should refund to the sender. It is
@@ -351,6 +353,10 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context,
 	cfg *types.EVMConfig,
 	txConfig statedb.TxConfig,
 ) (*types.MsgEthereumTxResponse, error) {
+
+	span := tracerN.NewEthermintTracer().StartSpan("ApplyMessageWithConfig")
+	defer span.End()
+
 	var (
 		ret   []byte // return bytes from evm execution
 		vmErr error  // vm errors do not effect consensus and are therefore not assigned to err
@@ -405,10 +411,14 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context,
 		// - reset sender's nonce to msg.Nonce() before calling evm.
 		// - increase sender's nonce by one no matter the result.
 		stateDB.SetNonce(sender.Address(), msg.Nonce())
+		span = tracerN.EthermintTracer.StartSpan("evm.Create")
 		ret, _, leftoverGas, vmErr = evm.Create(sender, msg.Data(), leftoverGas, msg.Value())
+		span.End()
 		stateDB.SetNonce(sender.Address(), msg.Nonce()+1)
 	} else {
+		span = tracerN.EthermintTracer.StartSpan("evm.call")
 		ret, leftoverGas, vmErr = evm.Call(sender, *msg.To(), msg.Data(), leftoverGas, msg.Value())
+		span.End()
 	}
 
 	refundQuotient := params.RefundQuotient
