@@ -39,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	ethparams "github.com/ethereum/go-ethereum/params"
 
+	rpctypes "github.com/evmos/ethermint/rpc/types"
 	ethermint "github.com/evmos/ethermint/types"
 	"github.com/evmos/ethermint/x/evm/statedb"
 	"github.com/evmos/ethermint/x/evm/types"
@@ -231,6 +232,13 @@ func (k Keeper) EthCall(c context.Context, req *types.EthCallRequest) (*types.Ms
 		return nil, status.Error(codes.InvalidArgument, "empty request")
 	}
 
+	var overrides rpctypes.StateOverride
+	if len(req.Overrides) > 0 {
+		if err := json.Unmarshal(req.Overrides, &overrides); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+	}
+
 	ctx := sdk.UnwrapSDKContext(c)
 
 	var args types.TransactionArgs
@@ -259,9 +267,7 @@ func (k Keeper) EthCall(c context.Context, req *types.EthCallRequest) (*types.Ms
 	txConfig := statedb.NewEmptyTxConfig(common.BytesToHash(ctx.HeaderHash()))
 
 	// pass false to not commit StateDB
-	commit := false
-	consumeFee := false
-	res, err := k.ApplyMessageWithConfig(ctx, msg, nil, commit, consumeFee, cfg, txConfig)
+	res, err := k.ApplyMessageWithConfig(ctx, msg, nil, false, cfg, txConfig, &overrides, false)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -341,24 +347,22 @@ func (k Keeper) EstimateGas(c context.Context, req *types.EthCallRequest) (*type
 	// Create a helper to check if a gas allowance results in an executable transaction
 	executable := func(gas uint64) (vmError bool, rsp *types.MsgEthereumTxResponse, err error) {
 		// update the message with the new gas value
-		msg = ethtypes.NewMessage(
-			msg.From(),
-			msg.To(),
-			msg.Nonce(),
-			msg.Value(),
-			gas,
-			msg.GasPrice(),
-			msg.GasFeeCap(),
-			msg.GasTipCap(),
-			msg.Data(),
-			msg.AccessList(),
-			msg.IsFake(),
-		)
+		msg = core.Message{
+			From:              msg.From,
+			To:                msg.To,
+			Nonce:             msg.Nonce,
+			Value:             msg.Value,
+			GasLimit:          gas,
+			GasPrice:          msg.GasPrice,
+			GasFeeCap:         msg.GasFeeCap,
+			GasTipCap:         msg.GasTipCap,
+			Data:              msg.Data,
+			AccessList:        msg.AccessList,
+			SkipAccountChecks: msg.SkipAccountChecks,
+		}
 
 		// pass false to not commit StateDB
-		commit := false
-		consumeFee := false
-		rsp, err = k.ApplyMessageWithConfig(ctx, msg, nil, commit, consumeFee, cfg, txConfig)
+		rsp, err = k.ApplyMessageWithConfig(ctx, msg, nil, false, cfg, txConfig, nil, false)
 		if err != nil {
 			if errors.Is(err, core.ErrIntrinsicGas) {
 				return true, nil, nil // Special case, raise gas limit
@@ -434,15 +438,13 @@ func (k Keeper) TraceTx(c context.Context, req *types.QueryTraceTxRequest) (*typ
 	txConfig := statedb.NewEmptyTxConfig(common.BytesToHash(ctx.HeaderHash().Bytes()))
 	for i, tx := range req.Predecessors {
 		ethTx := tx.AsTransaction()
-		msg, err := ethTx.AsMessage(signer, cfg.BaseFee)
+		msg, err := core.TransactionToMessage(ethTx, signer, cfg.BaseFee)
 		if err != nil {
 			continue
 		}
 		txConfig.TxHash = ethTx.Hash()
 		txConfig.TxIndex = uint(i)
-		commit := true
-		consumeFee := true
-		rsp, err := k.ApplyMessageWithConfig(ctx, msg, types.NewNoOpTracer(), commit, consumeFee, cfg, txConfig)
+		rsp, err := k.ApplyMessageWithConfig(ctx, *msg, types.NewNoOpTracer(), true, cfg, txConfig, nil, true)
 		if err != nil {
 			continue
 		}
@@ -455,18 +457,7 @@ func (k Keeper) TraceTx(c context.Context, req *types.QueryTraceTxRequest) (*typ
 		txConfig.TxIndex++
 	}
 
-	var tracerConfig json.RawMessage
-	if req.TraceConfig != nil && req.TraceConfig.TracerJsonConfig != "" {
-		// ignore error. default to no traceConfig
-		_ = json.Unmarshal([]byte(req.TraceConfig.TracerJsonConfig), &tracerConfig)
-	}
-
-	msg, err := tx.AsMessage(signer, cfg.BaseFee)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	commit := false
-	result, _, err := k.traceMsg(ctx, cfg, txConfig, msg, req.TraceConfig, commit, tracerConfig)
+	result, _, err := k.traceTx(ctx, cfg, txConfig, signer, tx, req.TraceConfig, false)
 	if err != nil {
 		// error will be returned with detail status from traceTx
 		return nil, err
@@ -524,11 +515,7 @@ func (k Keeper) TraceBlock(c context.Context, req *types.QueryTraceBlockRequest)
 		ethTx := tx.AsTransaction()
 		txConfig.TxHash = ethTx.Hash()
 		txConfig.TxIndex = uint(i)
-		msg, err := ethTx.AsMessage(signer, cfg.BaseFee)
-		if err != nil {
-			result.Error = status.Error(codes.Internal, err.Error()).Error()
-		}
-		traceResult, logIndex, err := k.traceMsg(ctx, cfg, txConfig, msg, req.TraceConfig, true, nil)
+		traceResult, logIndex, err := k.traceTx(ctx, cfg, txConfig, signer, ethTx, req.TraceConfig, true)
 		if err != nil {
 			result.Error = err.Error()
 		} else {
@@ -596,16 +583,8 @@ func (k Keeper) TraceCall(c context.Context, req *types.QueryTraceCallRequest) (
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	fmt.Println(594, msg.GasPrice())
 
-	var tracerConfig json.RawMessage
-	if req.TraceConfig != nil && req.TraceConfig.TracerJsonConfig != "" {
-		// ignore error. default to no traceConfig
-		_ = json.Unmarshal([]byte(req.TraceConfig.TracerJsonConfig), &tracerConfig)
-	}
-
-	commit := true
-	result, _, err := k.traceMsg(ctx, cfg, txConfig, msg, req.TraceConfig, commit, tracerConfig)
+	result, _, err := k.traceMsg(ctx, cfg, txConfig, msg, req.TraceConfig, false)
 	if err != nil {
 		// error will be returned with detail status from traceTx
 		return nil, err
@@ -626,10 +605,9 @@ func (k *Keeper) traceMsg(
 	ctx sdk.Context,
 	cfg *statedb.EVMConfig,
 	txConfig statedb.TxConfig,
-	msg ethtypes.Message,
+	msg core.Message,
 	traceConfig *types.TraceConfig,
 	commitMessage bool,
-	tracerJSONConfig json.RawMessage,
 ) (*interface{}, uint, error) {
 	// Assemble the structured logger or the JavaScript tracer
 	var (
@@ -659,14 +637,22 @@ func (k *Keeper) traceMsg(
 
 	tracer = logger.NewStructLogger(&logConfig)
 
-	tCtx := &tracers.Context{
-		BlockHash: txConfig.BlockHash,
-		TxIndex:   int(txConfig.TxIndex),
-		TxHash:    txConfig.TxHash,
+	txIndex, err := ethermint.SafeInt(txConfig.TxIndex)
+	if err != nil {
+		return nil, 0, status.Error(codes.Internal, err.Error())
 	}
 
+	tCtx := &tracers.Context{
+		BlockHash: txConfig.BlockHash,
+		TxIndex:   txIndex,
+		TxHash:    txConfig.TxHash,
+	}
 	if traceConfig.Tracer != "" {
-		if tracer, err = tracers.New(traceConfig.Tracer, tCtx, tracerJSONConfig); err != nil {
+		var cfg json.RawMessage
+		if traceConfig.TracerJsonConfig != "" {
+			cfg = json.RawMessage(traceConfig.TracerJsonConfig)
+		}
+		if tracer, err = tracers.DefaultDirectory.New(traceConfig.Tracer, tCtx, cfg); err != nil {
 			return nil, 0, status.Error(codes.Internal, err.Error())
 		}
 	}
@@ -689,14 +675,134 @@ func (k *Keeper) traceMsg(
 		}
 	}()
 
-	consumeFee := true
-	res, err := k.ApplyMessageWithConfig(ctx, msg, tracer, commitMessage, consumeFee, cfg, txConfig)
+	var stateOverrides rpctypes.StateOverride
+	if traceConfig.StateOverrides != nil {
+		config, err := json.Marshal(traceConfig.StateOverrides)
+		if err != nil {
+			return nil, 0, status.Error(codes.InvalidArgument, err.Error())
+		}
+
+		if err := json.Unmarshal(config, &stateOverrides); err != nil {
+			return nil, 0, status.Error(codes.InvalidArgument, err.Error())
+		}
+	}
+
+	res, err := k.ApplyMessageWithConfig(ctx, msg, tracer, commitMessage, cfg, txConfig, &stateOverrides, true)
 	if err != nil {
 		return nil, 0, status.Error(codes.Internal, err.Error())
 	}
 
 	if res.VmError != "" {
-		return nil, 0, status.Error(codes.Internal, res.VmError)
+		if res.VmError != vm.ErrExecutionReverted.Error() {
+			return nil, 0, status.Error(codes.Internal, res.VmError)
+		}
+	}
+
+	var result interface{}
+	result, err = tracer.GetResult()
+	if err != nil {
+		return nil, 0, status.Error(codes.Internal, err.Error())
+	}
+
+	return &result, txConfig.LogIndex + uint(len(res.Logs)), nil
+}
+
+// traceMsg do trace on one Ethereum message, it returns a tuple: (traceResult, nextLogIndex, error).
+func (k *Keeper) traceTx(
+	ctx sdk.Context,
+	cfg *statedb.EVMConfig,
+	txConfig statedb.TxConfig,
+	signer ethtypes.Signer,
+	tx *ethtypes.Transaction,
+	traceConfig *types.TraceConfig,
+	commitMessage bool,
+) (*interface{}, uint, error) {
+	// Assemble the structured logger or the JavaScript tracer
+	var (
+		tracer    tracers.Tracer
+		overrides *ethparams.ChainConfig
+		err       error
+		timeout   = defaultTraceTimeout
+	)
+	msg, err := core.TransactionToMessage(tx, signer, cfg.BaseFee)
+	if err != nil {
+		return nil, 0, status.Error(codes.Internal, err.Error())
+	}
+
+	if traceConfig == nil {
+		traceConfig = &types.TraceConfig{}
+	}
+
+	if traceConfig.Overrides != nil {
+		overrides = traceConfig.Overrides.EthereumConfig(cfg.ChainConfig.ChainID)
+	}
+
+	logConfig := logger.Config{
+		EnableMemory:     traceConfig.EnableMemory,
+		DisableStorage:   traceConfig.DisableStorage,
+		DisableStack:     traceConfig.DisableStack,
+		EnableReturnData: traceConfig.EnableReturnData,
+		Debug:            traceConfig.Debug,
+		Limit:            int(traceConfig.Limit),
+		Overrides:        overrides,
+	}
+
+	tracer = logger.NewStructLogger(&logConfig)
+
+	tCtx := &tracers.Context{
+		BlockHash: txConfig.BlockHash,
+		TxIndex:   int(txConfig.TxIndex),
+		TxHash:    txConfig.TxHash,
+	}
+	if traceConfig.Tracer != "" {
+		var cfg json.RawMessage
+		if traceConfig.TracerJsonConfig != "" {
+			cfg = json.RawMessage(traceConfig.TracerJsonConfig)
+		}
+		if tracer, err = tracers.DefaultDirectory.New(traceConfig.Tracer, tCtx, cfg); err != nil {
+			return nil, 0, status.Error(codes.Internal, err.Error())
+		}
+	}
+
+	// Define a meaningful timeout of a single transaction trace
+	if traceConfig.Timeout != "" {
+		if timeout, err = time.ParseDuration(traceConfig.Timeout); err != nil {
+			return nil, 0, status.Errorf(codes.InvalidArgument, "timeout value: %s", err.Error())
+		}
+	}
+
+	// Handle timeouts and RPC cancellations
+	deadlineCtx, cancel := context.WithTimeout(ctx.Context(), timeout)
+	defer cancel()
+
+	go func() {
+		<-deadlineCtx.Done()
+		if errors.Is(deadlineCtx.Err(), context.DeadlineExceeded) {
+			tracer.Stop(errors.New("execution timeout"))
+		}
+	}()
+
+	var stateOverrides rpctypes.StateOverride
+	if traceConfig.StateOverrides != nil {
+		config, err := json.Marshal(traceConfig.StateOverrides)
+		if err != nil {
+			return nil, 0, status.Error(codes.InvalidArgument, err.Error())
+		}
+
+		if err := json.Unmarshal(config, &stateOverrides); err != nil {
+			return nil, 0, status.Error(codes.InvalidArgument, err.Error())
+		}
+	}
+
+	res, err := k.ApplyMessageWithConfig(ctx, *msg, tracer, commitMessage, cfg, txConfig, &stateOverrides, true)
+	if err != nil {
+		return nil, 0, status.Error(codes.Internal, err.Error())
+	}
+
+	if res.VmError != "" {
+		if res.VmError != vm.ErrExecutionReverted.Error() {
+			return nil, 0, status.Error(codes.Internal, res.VmError)
+		}
 	}
 
 	var result interface{}
