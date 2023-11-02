@@ -81,6 +81,11 @@ func (a *API) TraceTransaction(hash common.Hash, config *evmtypes.TraceConfig) (
 	return a.backend.TraceTransaction(hash, config)
 }
 
+func (a *API) TraceCall(args evmtypes.TransactionArgs, blockNrOrHash rpctypes.BlockNumberOrHash, config *evmtypes.TraceConfig) (interface{}, error) {
+	a.logger.Debug("debug_traceCall", "args", args)
+	return a.backend.TraceCall(args, blockNrOrHash, config)
+}
+
 // TraceBlockByNumber returns the structured logs created during the execution of
 // EVM and returns them as a JSON object.
 func (a *API) TraceBlockByNumber(height rpctypes.BlockNumber, config *evmtypes.TraceConfig) ([]*evmtypes.TxTraceResult, error) {

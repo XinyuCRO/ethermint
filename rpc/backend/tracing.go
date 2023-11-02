@@ -18,6 +18,7 @@ package backend
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	tmrpctypes "github.com/cometbft/cometbft/rpc/core/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -27,6 +28,102 @@ import (
 	evmtypes "github.com/evmos/ethermint/x/evm/types"
 	"github.com/pkg/errors"
 )
+
+const (
+	// defaultTraceTimeout is the amount of time a single transaction can execute
+	// by default before being forcefully aborted.
+	defaultTraceTimeout = 5 * time.Second
+
+	// defaultTraceReexec is the number of blocks the tracer is willing to go back
+	// and reexecute to produce missing historical state necessary to run a specific
+	// trace.
+	defaultTraceReexec = uint64(128)
+
+	// defaultTracechainMemLimit is the size of the triedb, at which traceChain
+	// switches over and tries to use a disk-backed database instead of building
+	// on top of memory.
+	// For non-archive nodes, this limit _will_ be overblown, as disk-backed tries
+	// will only be found every ~15K blocks or so.
+	defaultTracechainMemLimit = common.StorageSize(500 * 1024 * 1024)
+
+	// maximumPendingTraceStates is the maximum number of states allowed waiting
+	// for tracing. The creation of trace state will be paused if the unused
+	// trace states exceed this limit.
+	maximumPendingTraceStates = 128
+)
+
+func (b *Backend) TraceCall(args evmtypes.TransactionArgs, blockNrOrHash rpctypes.BlockNumberOrHash, config *evmtypes.TraceConfig) (interface{}, error) {
+	// Try to retrieve the specified block
+	blockNum, err := b.BlockNumberFromTendermint(blockNrOrHash)
+	if err != nil {
+		return nil, errors.New("invalid arguments; neither block nor hash specified")
+	}
+
+	if blockNum == rpctypes.EthPendingBlockNumber {
+		// We don't have access to the miner here. For tracing 'future' transactions,
+		// it can be done with block- and state-overrides instead, which offers
+		// more flexibility and stability than trying to trace on 'pending', since
+		// the contents of 'pending' is unstable and probably not a true representation
+		// of what the next actual block is likely to contain.
+		return nil, errors.New("tracing on top of pending is not supported")
+	}
+
+	resBlock, err := b.TendermintBlockByNumber(blockNum)
+	if err != nil {
+		b.logger.Debug("block not found", "height", resBlock.BlockID)
+		return nil, err
+	}
+
+	blockRes, err := b.TendermintBlockResultByNumber(&resBlock.Block.Height)
+	if err != nil {
+		return nil, fmt.Errorf("block result not found for height %d", resBlock.Block.Height)
+	}
+
+	// try to recompute the state
+	reexec := defaultTraceReexec
+	if config != nil && config.Reexec != 0 {
+		reexec = config.Reexec
+	}
+
+	baseFee, err := b.BaseFee(blockRes)
+	if err != nil {
+		// handle the error for pruned node.
+		b.logger.Error("failed to fetch Base Fee from prunned block. Check node prunning configuration", "height", blockRes.Height, "error", err)
+	}
+
+	msg, err := args.ToMessage(b.RPCGasCap(), baseFee)
+	if err != nil {
+		return nil, err
+	}
+
+	// statedb, release, err := api.backend.StateAtBlock(ctx, block, reexec, nil, true, false)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// defer release()
+
+	// vmctx := core.NewEVMBlockContext(block.Header(), api.chainContext(ctx), nil)
+	// // Apply the customization rules if required.
+	// if config != nil {
+	// 	if err := config.StateOverrides.Apply(statedb); err != nil {
+	// 		return nil, err
+	// 	}
+	// 	config.BlockOverrides.Apply(&vmctx)
+	// }
+	// // Execute the trace
+	// msg, err := args.ToMessage(api.backend.RPCGasCap(), block.BaseFee())
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	// var traceConfig *TraceConfig
+	// if config != nil {
+	// 	traceConfig = &config.TraceConfig
+	// }
+	// return api.traceTx(ctx, msg, new(Context), vmctx, statedb, traceConfig)
+
+	return nil, nil
+}
 
 // TraceTransaction returns the structured logs created during the execution of EVM
 // and returns them as a JSON object.
